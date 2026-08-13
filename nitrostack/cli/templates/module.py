@@ -1,0 +1,12 @@
+from nitrostack import module
+
+
+@module(
+    name="{name}",
+    imports=[],
+    controllers=[],
+    providers=[],
+    exports=[]
+)
+class {camel_name}Module:
+    pass

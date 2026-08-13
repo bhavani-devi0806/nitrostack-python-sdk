@@ -12,7 +12,7 @@ A Python-idiomatic port of the **NitroStack** Model Context Protocol (MCP) frame
 - **Asynchronous Background Tasks**: Spawn background workers automatically for long-running tools.
 - **Built-in Authentication**: Modules for API Keys, JWT verification, and OAuth 2.1 (featuring Protected Resource Metadata discovery servers).
 - **In-Process Testing Harness**: Run unit and integration tests against modules without managing subprocesses or real network transports.
-- **CLI Tooling (`nitrostack-py`)**: Scaffold new apps (`init`), generate boilerplates (`generate`), auto-register servers with Claude (`register`), and run hot-reload development servers (`dev`).
+- **CLI Tooling (`nitrostack-py`)**: Scaffold apps (`init`), generate components (`generate`), pack deployable wheels (`pack`), upgrade/install dependencies, validate projects, auto-register servers with Claude (`register`), and run hot-reload development servers (`dev`).
 
 ---
 
@@ -47,6 +47,73 @@ This launches an interactive prompt where you can:
 2. **Provide metadata**: Specify a custom description and author name.
 
 Once scaffolded, follow the next steps printed by the CLI to run your server, configure environment variables, and try it out.
+
+---
+
+## CLI (`nitrostack-py`)
+
+The CLI is installed with the SDK (`nitrostack-py`, or `python -m nitrostack.cli.main`). Run `nitrostack-py --help` to list commands.
+
+### Project lifecycle
+
+```bash
+nitrostack-py init my-server
+nitrostack-py dev          # hot-reload development server
+nitrostack-py start        # production server (no reload)
+nitrostack-py register --name my-mcp-server --file app.py
+```
+
+### Generate components
+
+Existing `tool` and `module` generators are unchanged. Additional generators create pipeline and service stubs that follow the current Python decorator/protocol APIs:
+
+```bash
+nitrostack-py generate tool add_numbers
+nitrostack-py generate module payments
+nitrostack-py generate guard MyGuard
+nitrostack-py generate pipe Validation
+nitrostack-py generate interceptor Transform
+nitrostack-py generate filter HttpException
+nitrostack-py generate service Email
+```
+
+Generated files:
+
+| Command | Output |
+|---|---|
+| `generate tool <name>` | `{name}_tool.py` in the current directory |
+| `generate module <name>` | `{name}_module.py` in the current directory |
+| `generate guard <Name>` | `guards/<name>.py` |
+| `generate pipe <Name>` | `pipes/<name>.py` |
+| `generate interceptor <Name>` | `interceptors/<name>.py` |
+| `generate filter <Name>` | `filters/<name>.py` |
+| `generate service <Name>` | `services/<name>.py` |
+
+Attach generated pipeline classes with `@use_guards`, `@use_pipes`, `@use_interceptors`, or `@use_filters`. Register services in a module's `providers` list.
+
+### Pack a deployable wheel
+
+```bash
+nitrostack-py pack --dry-run    # list files; does not write an artifact
+nitrostack-py pack              # write dist/*.whl
+```
+
+`pack` builds a wheel with setuptools (the same backend as this SDK), refreshes `requirements.txt` from `pyproject.toml` when possible, and always includes `.env.example`. The real `.env` file and other secrets are never packed. Temporary build directories are deleted afterwards.
+
+### Upgrade, install, validate
+
+```bash
+nitrostack-py upgrade                 # latest nitrostack on PyPI
+nitrostack-py upgrade --version 0.3.2 # pin a specific version
+nitrostack-py upgrade --dry-run       # print the change; do not edit files
+
+nitrostack-py install                 # install project + development dependencies
+nitrostack-py install --production    # skip optional extras and requirements-dev.txt
+
+nitrostack-py validate                # lint deps, @mcp_app imports, and @module() refs
+```
+
+`upgrade` updates the `nitrostack` dependency spec in `pyproject.toml` in place (and `requirements.txt` when it already pins nitrostack). `validate` reports missing/conflicting dependencies, `@mcp_app` modules that fail to import, and `@module()` `imports`/`exports` that are not real classes.
 
 ---
 
@@ -210,6 +277,7 @@ python tests/test_basic.py
 python tests/test_tasks.py
 python tests/test_initial_tool.py
 python tests/test_transports.py
+pytest tests/test_cli.py -v
 ```
 
 ### Testing Harness

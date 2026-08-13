@@ -25,7 +25,7 @@ nitrostack-studio = "nitrostack.studio:start_server_cli"
 include = ["nitrostack*"]
 
 [tool.setuptools.package-data]
-nitrostack = ["static/*", "templates/**/*"]
+nitrostack = ["static/*", "templates/**/*", "cli/templates/*"]
 
 [tool.ruff]
 line-length = 100

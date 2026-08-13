@@ -36,3 +36,4 @@ jobs:
         python tests/test_production.py
         python tests/test_widget_metadata.py
         python tests/test_transports.py
+        pytest tests/test_cli.py -v

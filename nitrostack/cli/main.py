@@ -4,6 +4,12 @@ import argparse
 import subprocess
 import time
 
+from nitrostack.cli.generate import generate_component, generate_module as generate_module_from_template
+from nitrostack.cli.install import install_dependencies
+from nitrostack.cli.pack import pack_project
+from nitrostack.cli.upgrade import UpgradeError, upgrade_project
+from nitrostack.cli.validators import format_report, validate_project
+
 MAIN_TEMPLATE = """import asyncio
 from nitrostack import McpApplicationFactory
 from app_module import AppModule
@@ -1127,15 +1133,7 @@ def generate_tool(name: str):
     print(f"Generated tool boilerplate in '{filename}'")
 
 def generate_module(name: str):
-    filename = f"{name}_module.py"
-    if os.path.exists(filename):
-        print(f"Error: File '{filename}' already exists.")
-        sys.exit(1)
-    camel_name = "".join(part.capitalize() for part in name.split("_"))
-    content = MODULE_TEMPLATE.format(name=name, camel_name=camel_name)
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"Generated module boilerplate in '{filename}'")
+    generate_module_from_template(name)
 
 def get_claude_config_paths():
     paths = []
@@ -1231,10 +1229,20 @@ def main():
             pass
 
     parser = argparse.ArgumentParser(
-        description="nitrostack-py CLI — Scaffold, develop, and run NitroStack Python MCP servers",
-        prog="nitrostack-py"
+        prog="nitrostack-py",
+        description="nitrostack-py CLI — Scaffold, develop, pack, and run NitroStack Python MCP servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  nitrostack-py init my-server\n"
+            "  nitrostack-py generate guard MyGuard\n"
+            "  nitrostack-py pack --dry-run\n"
+            "  nitrostack-py upgrade --dry-run\n"
+            "  nitrostack-py install --production\n"
+            "  nitrostack-py validate\n"
+        ),
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", metavar="command")
 
     # init command
     init_parser = subparsers.add_parser("init", help="Initialize a new NitroStack MCP server project")
@@ -1253,14 +1261,72 @@ def main():
     reg_parser.add_argument("--file", default="main.py", help="Python script to register (defaults to main.py)")
 
     # generate command
-    gen_parser = subparsers.add_parser("generate", help="Generate boilerplate code")
-    gen_subparsers = gen_parser.add_subparsers(dest="generator")
-    
+    gen_parser = subparsers.add_parser(
+        "generate",
+        help="Generate boilerplate code (tool, module, guard, pipe, interceptor, filter, service)",
+    )
+    gen_subparsers = gen_parser.add_subparsers(dest="generator", metavar="type")
+
     tool_parser = gen_subparsers.add_parser("tool", help="Generate a new tool boilerplate")
     tool_parser.add_argument("name", help="Name of the tool")
 
     mod_parser = gen_subparsers.add_parser("module", help="Generate a new module boilerplate")
     mod_parser.add_argument("name", help="Name of the module")
+
+    for kind, kind_help in (
+        ("guard", "Generate an authorization guard"),
+        ("pipe", "Generate a validation/transform pipe"),
+        ("interceptor", "Generate an execution interceptor"),
+        ("filter", "Generate an exception filter"),
+        ("service", "Generate an injectable service"),
+    ):
+        kind_parser = gen_subparsers.add_parser(kind, help=kind_help)
+        kind_parser.add_argument("name", help=f"Name of the {kind}")
+
+    # pack command
+    pack_parser = subparsers.add_parser(
+        "pack",
+        help="Build a deployable wheel of the current project (never includes .env/secrets)",
+    )
+    pack_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show files that would be packed without creating the artifact",
+    )
+
+    # upgrade command
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Update the nitrostack dependency to the latest (or a specific) PyPI version",
+    )
+    upgrade_parser.add_argument(
+        "--version",
+        dest="target_version",
+        metavar="X.Y.Z",
+        help="Pin nitrostack to this version instead of the latest PyPI release",
+    )
+    upgrade_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the version change without modifying pyproject.toml",
+    )
+
+    # install command
+    install_parser = subparsers.add_parser(
+        "install",
+        help="Install project dependencies from pyproject.toml / requirements.txt",
+    )
+    install_parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Skip development dependencies (optional extras and requirements-dev.txt)",
+    )
+
+    # validate command
+    subparsers.add_parser(
+        "validate",
+        help="Lint project config, @mcp_app imports, and @module() class references",
+    )
 
     args = parser.parse_args()
 
@@ -1278,12 +1344,37 @@ def main():
         register_server(args.name, args.file)
     elif args.command == "generate":
         if not args.generator:
-            parser.parse_args(["generate", "--help"])
+            gen_parser.print_help()
             sys.exit(1)
         if args.generator == "tool":
             generate_tool(args.name)
         elif args.generator == "module":
             generate_module(args.name)
+        else:
+            generate_component(args.generator, args.name)
+    elif args.command == "pack":
+        try:
+            pack_project(dry_run=args.dry_run)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+    elif args.command == "upgrade":
+        try:
+            upgrade_project(version=args.target_version, dry_run=args.dry_run)
+        except UpgradeError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+    elif args.command == "install":
+        try:
+            install_dependencies(production=args.production)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+    elif args.command == "validate":
+        issues = validate_project()
+        print(format_report(issues))
+        if any(issue.severity == "error" for issue in issues):
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
