@@ -1,10 +1,9 @@
 """
 Low-level MCP server ownership for nitrostack.
 
-Mirrors how the TypeScript SDK builds directly on `@modelcontextprotocol/sdk`'s
-low-level `Server` class (see `NitroStackServer` in the TS core) instead of a
-higher-level convenience wrapper: nitrostack owns registration/dispatch and
-only declares the protocol-level capabilities it actually implements.
+Builds directly on the Python `mcp` SDK's low-level `Server` class: nitrostack
+owns registration/dispatch and only declares the protocol-level capabilities
+it actually implements.
 """
 from typing import Any, Dict, Optional
 
@@ -19,8 +18,7 @@ class NitroStackMcpServer(LowLevelServer):
 
     The base `Server.get_capabilities()` only advertises a capability when a
     handler for the corresponding request type has been registered, and it
-    always reports `resources.subscribe=False`. This subclass declares the
-    same static capability set the TypeScript SDK's `mcpServerOptions` uses:
+    always reports `resources.subscribe=False`. This subclass declares:
     `listChanged=True` for tools/resources/prompts, `resources.subscribe=True`
     (nitrostack always registers subscribe/unsubscribe handlers), and the
     `tasks` capability whenever nitrostack's task subsystem handlers are

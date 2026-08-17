@@ -5,7 +5,7 @@
 # decorators, requiring a valid OAuth token from the configured introspection endpoint or JWKS provider.
 #
 # To run this example, configure the OAuth settings in your .env file:
-#   PORT=8000
+#   PORT=3000
 #   RESOURCE_URI=https://mcplocal
 #   AUTH_SERVER_URL=https://dev-5dt0utuk315713tjm.us.auth0.com
 #   OAUTH_INTROSPECTION_ENDPOINT=http://localhost:3000/oauth/introspect

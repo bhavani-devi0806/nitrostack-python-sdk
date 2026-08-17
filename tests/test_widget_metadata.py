@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from nitrostack import injectable, tool, widget, module, ExecutionContext
+from nitrostack.core.decorators import widget_resource_uri
 from nitrostack.testing import NitroTestingModule
 from pydantic import BaseModel
 import mcp.types as types
@@ -63,11 +64,27 @@ async def main():
     print("Tool metadata:", meta)
     
     # Check that widget fields are populated in metadata
-    assert meta.get("ui/template") == "my-custom-widget-route"
-    assert meta.get("openai/outputTemplate") == "my-custom-widget-route"
-    assert meta.get("ui") == {"resourceUri": "my-custom-widget-route"}
+    assert meta.get("ui/template") == "ui://widget/my-custom-widget-route.html"
+    assert meta.get("openai/outputTemplate") == "ui://widget/my-custom-widget-route.html"
+    assert meta.get("ui") == {"resourceUri": "ui://widget/my-custom-widget-route.html"}
     
     print("Success! Widget metadata is correctly mapped and verified in the MCP Tool specification.")
 
+
+def test_widget_metadata_on_listed_tool():
+    asyncio.run(main())
+
+
+def test_widget_resource_uri_normalization():
+    assert widget_resource_uri("calculator-result") == "ui://widget/calculator-result.html"
+    assert widget_resource_uri("ui://widget/pizza-map.html") == "ui://widget/pizza-map.html"
+    try:
+        widget_resource_uri("")
+        raise AssertionError("empty route should raise")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
+    test_widget_resource_uri_normalization()
     asyncio.run(main())

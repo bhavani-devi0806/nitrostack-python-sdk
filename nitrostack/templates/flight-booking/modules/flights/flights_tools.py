@@ -18,6 +18,9 @@ class FlightDetailsInput(BaseModel):
 class AirportSearchInput(BaseModel):
     query: str = Field(description="The search query for airports (e.g., 'London', 'New York')")
 
+class GetAirlinesInput(BaseModel):
+    pass
+
 @injectable(deps=[DuffelService])
 class FlightTools:
     def __init__(self, service: DuffelService):
@@ -68,10 +71,11 @@ class FlightTools:
     @tool(
         name="get_airlines",
         title="Get Airlines",
-        description="Get list of common airlines."
+        description="Get list of common airlines.",
+        input_schema=GetAirlinesInput
     )
     @use_guards(OAuthGuard, create_scope_guard(["read"]))
-    async def get_airlines(self, context: ExecutionContext) -> dict:
+    async def get_airlines(self, input: GetAirlinesInput, context: ExecutionContext) -> dict:
         context.logger.info("Fetching common airlines")
         res = await self.service.get_airlines()
         return {"airlines": res}

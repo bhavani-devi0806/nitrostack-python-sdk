@@ -6,7 +6,7 @@ from typing import Any, Protocol, List, Dict, Optional
 
 from nitrostack.core.errors import TaskCancelledError
 
-# Protocol for Logger matching TS Winstron logger equivalent (Section 13)
+# Logger protocol used by ExecutionContext (Section 13)
 class Logger(Protocol):
     def debug(self, message: str, meta: dict | None = None) -> None: ...
     def info(self, message: str, meta: dict | None = None) -> None: ...

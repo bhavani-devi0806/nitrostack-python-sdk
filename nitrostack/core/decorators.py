@@ -69,6 +69,31 @@ class PromptConfig:
     description: str
     arguments: List[PromptArgument] = field(default_factory=list)
 
+
+def widget_resource_uri(route_path: str) -> str:
+    """Normalize a widget route to the MCP Apps `ui://` resource URI.
+
+    MCP Inspector throws (and blanks the Tools tab) if `_meta.ui.resourceUri`
+    is set to anything that does not start with `ui://`.
+    """
+    route = (route_path or "").strip()
+    if not route:
+        raise ValueError("widget route must not be empty")
+    if route.startswith("ui://"):
+        return route
+    name = route.strip("/").removeprefix("widget/").removesuffix(".html").strip("/")
+    if not name:
+        raise ValueError("widget route must not be empty")
+    return f"ui://widget/{name}.html"
+
+
+def _apply_widget_metadata(metadata: Dict[str, Any], route_path: str) -> None:
+    uri = widget_resource_uri(route_path)
+    metadata["ui/template"] = uri
+    metadata["ui"] = {"resourceUri": uri}
+    metadata["openai/outputTemplate"] = uri
+
+
 def tool(
     name: str,
     description: str,
@@ -109,9 +134,7 @@ def tool(
         # Check if function already had a widget decorator applied first
         widget_route = getattr(func, "_mcp_widget", None)
         if widget_route:
-            config.metadata["ui/template"] = widget_route
-            config.metadata["ui"] = {"resourceUri": widget_route}
-            config.metadata["openai/outputTemplate"] = widget_route
+            _apply_widget_metadata(config.metadata, widget_route)
             
         func._mcp_tool_config = config
         return func
@@ -121,12 +144,12 @@ def widget(route_path: str):
     """
     Decorator to associate a UI widget route with a tool.
     """
+    uri = widget_resource_uri(route_path)
+
     def decorator(func: Callable):
-        func._mcp_widget = route_path
+        func._mcp_widget = uri
         if hasattr(func, "_mcp_tool_config"):
-            func._mcp_tool_config.metadata["ui/template"] = route_path
-            func._mcp_tool_config.metadata["ui"] = {"resourceUri": route_path}
-            func._mcp_tool_config.metadata["openai/outputTemplate"] = route_path
+            _apply_widget_metadata(func._mcp_tool_config.metadata, uri)
         return func
     return decorator
 

@@ -8,7 +8,7 @@ import os
     imports=[
         ConfigModule.for_root(
             env_file_path=".env",
-            defaults={"RESOURCE_URI": "https://mcplocal", "PORT": "8000"}
+            defaults={"RESOURCE_URI": "https://mcplocal", "PORT": "3000"}
         ),
         OAuthModule.for_root(
             resource_uri=os.environ.get("RESOURCE_URI", "https://mcplocal"),

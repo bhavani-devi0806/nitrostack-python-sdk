@@ -16,7 +16,7 @@ from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, create_model
 
 from nitrostack.core.context import ExecutionContext, TaskContext
-from nitrostack.core.decorators import ToolConfig, ResourceConfig, PromptConfig
+from nitrostack.core.decorators import ToolConfig, ResourceConfig, PromptConfig, _apply_widget_metadata
 from nitrostack.core.di import DIContainer
 from nitrostack.core.errors import (
     PromptNotFoundError,
@@ -30,6 +30,14 @@ from nitrostack.core.pipeline import run_pipeline
 from nitrostack.core.additional_decorators import HealthCheckRegistry
 from nitrostack.core.task import TaskManager, TaskStatus
 from nitrostack.events.event_emitter import EventEmitter
+
+
+DEFAULT_HTTP_PORT = 3000
+
+
+def resolve_http_port() -> int:
+    """MCP HTTP/dual bind port. Defaults to 3000; 3001 is reserved for widgets."""
+    return int(os.environ.get("PORT") or os.environ.get("MCP_SERVER_PORT") or DEFAULT_HTTP_PORT)
 
 
 @dataclass
@@ -89,6 +97,73 @@ def get_pydantic_model(schema: Any) -> Type[BaseModel]:
 
     # Return a default empty model if invalid or empty
     return create_model("EmptyInputModel")
+
+
+def _is_null_schema(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "null"
+
+
+def _unwrap_nullable_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn JSON Schema `T | null` into `T` so MCP Inspector can render widgets.
+
+    Pydantic v2 emits Optional fields as `anyOf: [{type: T}, {type: null}]` (or
+    `type: [T, "null"]`). Inspector/RJSF shows the property name but no input
+    control for those unions.
+    """
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list) or len(variants) != 2:
+            continue
+        non_null = [item for item in variants if not _is_null_schema(item)]
+        if len(non_null) != 1:
+            continue
+        merged = dict(non_null[0])
+        for extra_key, extra_val in schema.items():
+            if extra_key == key:
+                continue
+            if extra_key not in merged:
+                merged[extra_key] = extra_val
+            elif extra_key in ("description", "title", "default") and extra_val is not None:
+                merged[extra_key] = extra_val
+        if merged.get("default") is None:
+            merged.pop("default", None)
+        return merged
+
+    types = schema.get("type")
+    if isinstance(types, list):
+        non_null = [item for item in types if item != "null"]
+        if len(non_null) == 1:
+            schema = {**schema, "type": non_null[0]}
+            if schema.get("default") is None:
+                schema.pop("default", None)
+    return schema
+
+
+def inspector_friendly_schema(node: Any) -> Any:
+    """Normalize a Pydantic JSON Schema so MCP Inspector can render form fields."""
+    if isinstance(node, list):
+        return [inspector_friendly_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    unwrapped = _unwrap_nullable_schema(node)
+    return {key: inspector_friendly_schema(value) for key, value in unwrapped.items()}
+
+
+def parse_tool_input(input_model: Type[BaseModel], arguments: Optional[Dict[str, Any]]) -> BaseModel:
+    """Validate tool arguments from Inspector or the older nested wrap.
+
+    Inspector sends top-level fields (`{openNow: true}`).
+    Older Python clients wrap them (`{input: {openNow: true}}`).
+    """
+    arguments = arguments or {}
+    inner = arguments.get("input")
+    looks_wrapped = (
+        isinstance(inner, dict)
+        and set(arguments.keys()) <= {"input"}
+        and "input" not in input_model.model_fields
+    )
+    payload = inner if looks_wrapped else arguments
+    return input_model.model_validate(payload)
 
 
 @dataclass
@@ -265,7 +340,7 @@ class McpApplication:
         async def _list_tools() -> List[types.Tool]:
             return [self._build_tool_definition(entry) for entry in self._tools.values()]
 
-        @server.call_tool()
+        @server.call_tool(validate_input=False)
         async def _call_tool(name: str, arguments: Optional[Dict[str, Any]]):
             return await self._call_tool(name, arguments or {})
 
@@ -318,34 +393,22 @@ class McpApplication:
     # Definition builders (registry entry -> wire-level `mcp.types` objects)
     # ------------------------------------------------------------------
 
-    def _wrap_tool_input_schema(self, input_schema: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Wrap a Pydantic model JSON schema under `{"input": ...}` the way FastMCP
-        (and NitroStudio) expect.
+    def _tool_input_schema(self, input_model: Type[BaseModel]) -> Dict[str, Any]:
+        """JSON Schema for `tools/list` with fields at the top level.
 
-        Studio's form generator resolves `properties.input.$ref` against `$defs`
-        to render individual fields. Inlining the model under `properties.input`
-        makes Studio treat it as a single JSON-object blob — so we always emit the
-        `$ref` + `$defs` shape (matching FastMCP's previous wire contract).
+        MCP Inspector renders `inputSchema.properties` as form fields. Nesting
+        the model under `properties.input.$ref` only showed labels.
         """
-        nested_defs = dict(input_schema.get("$defs") or input_schema.get("definitions") or {})
-        model_schema = {k: v for k, v in input_schema.items() if k not in ("$defs", "definitions")}
-        model_name = model_schema.get("title") or "Input"
-        # Avoid colliding with an existing nested def of the same name
-        if model_name in nested_defs:
-            model_name = f"{model_name}Input"
-
-        return {
-            "type": "object",
-            "title": f"{model_name}Arguments",
-            "properties": {"input": {"$ref": f"#/$defs/{model_name}"}},
-            "required": ["input"],
-            "$defs": {**nested_defs, model_name: model_schema},
-        }
+        schema = inspector_friendly_schema(input_model.model_json_schema())
+        if not isinstance(schema, dict):
+            schema = {}
+        schema.setdefault("type", "object")
+        schema.setdefault("properties", {})
+        return schema
 
     def _build_tool_definition(self, entry: _ToolEntry) -> types.Tool:
         cfg = entry.config
-        wrapped_schema = self._wrap_tool_input_schema(entry.input_model.model_json_schema())
+        input_schema = self._tool_input_schema(entry.input_model)
 
         meta: Dict[str, Any] = {
             "is_initial": cfg.is_initial,
@@ -355,9 +418,7 @@ class McpApplication:
         }
         widget_route = getattr(entry.method, "_mcp_widget", None)
         if widget_route:
-            meta["ui/template"] = widget_route
-            meta["ui"] = {"resourceUri": widget_route}
-            meta["openai/outputTemplate"] = widget_route
+            _apply_widget_metadata(meta, widget_route)
         if cfg.invocation:
             meta["openai/toolInvocation/invoking"] = cfg.invocation.invoking
             meta["openai/toolInvocation/invoked"] = cfg.invocation.invoked
@@ -374,7 +435,7 @@ class McpApplication:
             meta["openai/function"] = {
                 "name": cfg.name,
                 "description": cfg.description,
-                "parameters": wrapped_schema,
+                "parameters": input_schema,
             }
         elif app_mode == "mcpapps":
             meta["_meta"] = {"ui": {"title": cfg.title or cfg.name, "description": cfg.description}}
@@ -394,7 +455,7 @@ class McpApplication:
             name=cfg.name,
             title=cfg.title,
             description=cfg.description,
-            inputSchema=wrapped_schema,
+            inputSchema=input_schema,
             annotations=annotations,
             execution=execution,
             **{"_meta": meta},
@@ -470,7 +531,11 @@ class McpApplication:
             )
 
         cfg = entry.config
-        input_instance = entry.input_model.model_validate(arguments.get("input", {}))
+        # Pydantic validates after accepting either Inspector top-level fields
+        # or the older `{input: {...}}` wrap. Low-level jsonschema is off
+        # (`validate_input=False`) so the wrap is not rejected against the
+        # published top-level inputSchema.
+        input_instance = parse_tool_input(entry.input_model, arguments)
         guards, middleware, interceptors, pipes, filters = self._pipeline_stages(entry.method)
 
         # Detect task-augmented invocation via the request context's public
@@ -846,7 +911,7 @@ class McpApplication:
 
         transport = os.environ.get("MCP_TRANSPORT_TYPE") or self.server_config.transport_type
         node_env = os.environ.get("NODE_ENV", "development")
-        port = int(os.environ.get("PORT") or os.environ.get("MCP_SERVER_PORT") or 8000)
+        port = resolve_http_port()
 
         stateless = self._env_bool("MCP_STATELESS")
         if stateless is None:

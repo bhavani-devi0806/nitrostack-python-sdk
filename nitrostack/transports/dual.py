@@ -38,7 +38,7 @@ async def run_dual(
     http_app: Any,
     *,
     host: str = "0.0.0.0",
-    port: int = 8000,
+    port: int = 3000,
     graceful_timeout: float = 10.0,
 ) -> None:
     """Run STDIO and Streamable HTTP concurrently until either one stops."""

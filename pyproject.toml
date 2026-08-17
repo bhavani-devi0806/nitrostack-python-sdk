@@ -9,7 +9,7 @@ description = "NitroStack Python SDK — A Python-idiomatic port of the NitroSta
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0,<2.0.0",
+    "mcp>=1.10.0,<2.0.0",
     "pydantic>=2.0.0",
     "starlette>=0.30.0",
     "uvicorn>=0.20.0",
@@ -19,13 +19,12 @@ dependencies = [
 
 [project.scripts]
 nitrostack-py = "nitrostack.cli.main:main"
-nitrostack-studio = "nitrostack.studio:start_server_cli"
 
 [tool.setuptools.packages.find]
 include = ["nitrostack*"]
 
 [tool.setuptools.package-data]
-nitrostack = ["static/*", "templates/**/*", "cli/templates/*"]
+nitrostack = ["templates/**/*", "cli/templates/*"]
 
 [tool.ruff]
 line-length = 100

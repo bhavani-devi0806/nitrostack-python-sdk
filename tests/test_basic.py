@@ -17,14 +17,14 @@ async def run_tests():
     # 1. Test 'calculate' tool
     print("\n1. Testing 'calculate' tool...")
     res = await harness.call_tool("calculate", {
-        "input": {"a": 12.5, "b": 3.5, "operation": "add"}
+        "a": 12.5, "b": 3.5, "operation": "add"
     })
     print("Add tool result:", res)
     assert res.get("status") == "success"
     assert res.get("result") == 16.0
     
     res_div = await harness.call_tool("calculate", {
-        "input": {"a": 10.0, "b": 0.0, "operation": "divide"}
+        "a": 10.0, "b": 0.0, "operation": "divide"
     })
     print("Divide by zero result:", res_div)
     assert "error" in res_div or res_div.get("status") == "failed"
@@ -32,10 +32,17 @@ async def run_tests():
     # 2. Test 'convert_temperature' tool
     print("\n2. Testing 'convert_temperature' tool...")
     res_temp = await harness.call_tool("convert_temperature", {
-        "input": {"value": 100.0, "from_unit": "celsius", "to_unit": "fahrenheit"}
+        "value": 100.0, "from_unit": "celsius", "to_unit": "fahrenheit"
     })
     print("Temp conversion result:", res_temp)
     assert res_temp.get("result") == 212.0
+
+    res_wrapped = await harness.call_tool("calculate", {
+        "input": {"a": 4.0, "b": 2.0, "operation": "multiply"}
+    })
+    print("Legacy wrapped calculate result:", res_wrapped)
+    assert res_wrapped.get("status") == "success"
+    assert res_wrapped.get("result") == 8.0
 
     # 3. Test resource templates: 'calculator://operations'
     print("\n3. Testing 'calculator://operations' resource...")

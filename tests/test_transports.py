@@ -167,7 +167,26 @@ def test_http_health_and_cors():
         assert preflight.headers.get("access-control-allow-origin") == "*"
         assert "Mcp-Session-Id" in preflight.headers.get("access-control-allow-headers", "")
 
-    print("Success! /mcp/health and CORS preflight behave as expected.")
+        root = client.get("/")
+        assert root.status_code == 200
+        assert "text/html" in root.headers.get("content-type", "")
+        assert "MCP" in root.text
+
+        version = client.get("/json/version")
+        assert version.status_code == 200
+        version_body = version.json()
+        assert version_body["transport"] == "mcp"
+        assert version_body["endpoints"]["mcp"] == "/mcp"
+        assert version_body["endpoints"]["sse"] == "/sse"
+
+        json_list = client.get("/json")
+        assert json_list.status_code == 200
+        assert json_list.json() == []
+
+        favicon = client.get("/favicon.ico")
+        assert favicon.status_code == 204
+
+    print("Success! /mcp/health, GET /, and Chrome /json probes behave as expected.")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +203,23 @@ def test_http_tool_call_parity():
         assert resp.status_code == 200, resp.text
         result = _extract_json_rpc(resp)["result"]
         assert result["content"][0]["text"] == "hello-http"
+
+        unwrapped = _call_tool(client, session_id, "echo", {"value": "top-level"}, req_id=3)
+        assert unwrapped.status_code == 200, unwrapped.text
+        unwrapped_result = _extract_json_rpc(unwrapped)["result"]
+        assert unwrapped_result["content"][0]["text"] == "top-level"
+
+        listed = client.post(
+            "/mcp",
+            headers={**JSON_HEADERS, "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}},
+        )
+        assert listed.status_code == 200, listed.text
+        tools = _extract_json_rpc(listed)["result"]["tools"]
+        echo = next(item for item in tools if item["name"] == "echo")
+        echo_props = echo["inputSchema"]["properties"]
+        assert "value" in echo_props
+        assert "input" not in echo_props
 
     print("Success! HTTP tool call returns the expected JSON-RPC result shape.")
 
@@ -430,7 +466,53 @@ def test_dual_mode_coordinated_shutdown():
 
 
 # ---------------------------------------------------------------------------
-# 9. Legacy SSE: messages path must use a trailing slash so POSTs hit
+# 9. `/mcp` (no trailing slash) must NOT 307 to `/mcp/`.
+#    MCP Inspector's Streamable HTTP client GETs `/mcp` for the SSE stream;
+#    a 307 on that GET drops the connection and blanks List Tools.
+# ---------------------------------------------------------------------------
+
+def test_mcp_path_does_not_redirect():
+    app = asyncio.run(_build_app())
+    http_app = build_http_app(app, enable_cors=True)
+
+    with TestClient(http_app, follow_redirects=False) as client:
+        init = client.post("/mcp", headers=JSON_HEADERS, json=INITIALIZE_BODY)
+        assert init.status_code == 200, (
+            f"POST /mcp should be handled directly, not redirected, got {init.status_code}"
+        )
+        session_id = init.headers.get("mcp-session-id")
+        assert session_id
+
+        client.post(
+            "/mcp",
+            headers={**JSON_HEADERS, "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        listed = client.post(
+            "/mcp",
+            headers={**JSON_HEADERS, "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert listed.status_code == 200, (
+            f"tools/list on /mcp should not redirect, got {listed.status_code}: {listed.text}"
+        )
+        payload = _extract_json_rpc(listed)
+        names = [t["name"] for t in payload.get("result", {}).get("tools", [])]
+        assert "echo" in names
+
+        slashed = client.post(
+            "/mcp/",
+            headers={**JSON_HEADERS, "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+        assert slashed.status_code == 200
+
+    print("Success! POST /mcp is handled without a 307 redirect; tools/list works.")
+
+
+# ---------------------------------------------------------------------------
+# 10. Legacy SSE: messages path must use a trailing slash so POSTs hit
 #    SseServerTransport instead of being swallowed by Mount("/mcp") /
 #    Streamable HTTP (which 406s clients that don't send Streamable Accept).
 # ---------------------------------------------------------------------------
@@ -476,5 +558,6 @@ if __name__ == "__main__":
     test_di_singletons_shared_across_transports()
     test_progress_notifications_pushed()
     test_dual_mode_coordinated_shutdown()
+    test_mcp_path_does_not_redirect()
     test_legacy_sse_messages_not_swallowed_by_streamable_http()
     print("\nAll Phase 3 transport tests passed successfully!")
