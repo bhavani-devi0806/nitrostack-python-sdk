@@ -63,6 +63,27 @@ def _load_template(filename: str) -> str:
         return handle.read()
 
 
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def _validate_generate_name(name: str) -> None:
+    if not name or not _NAME_RE.match(name):
+        print("Error: name must be a valid identifier (letters, numbers, '_' or '-').")
+        sys.exit(1)
+
+
+def _assert_dest_inside_root(dest: str, root: str) -> None:
+    real_dest = os.path.normcase(os.path.realpath(dest))
+    real_root = os.path.normcase(os.path.realpath(root))
+    try:
+        common = os.path.commonpath([real_dest, real_root])
+    except ValueError:
+        common = ""
+    if common != real_root:
+        print(f"Error: generated path would be written outside the project: {dest}")
+        sys.exit(1)
+
+
 def _write_file(path: str, content: str) -> None:
     if os.path.exists(path):
         print(f"Error: File '{path}' already exists.")
@@ -81,15 +102,14 @@ def generate_component(kind: str, name: str, cwd: Optional[str] = None) -> str:
     if kind not in COMPONENT_KINDS:
         print(f"Error: unknown generate target '{kind}'.")
         sys.exit(1)
-    if not name or not re.match(r"^[A-Za-z_][A-Za-z0-9_-]*$", name):
-        print("Error: name must be a valid identifier (letters, numbers, '_' or '-').")
-        sys.exit(1)
+    _validate_generate_name(name)
 
-    root = cwd or os.getcwd()
+    root = os.path.abspath(cwd or os.getcwd())
     class_name = class_name_for(kind, name)
     snake = to_snake_case(name)
     rel_path = os.path.join(_KIND_DIR[kind], f"{snake}.py")
     dest = os.path.join(root, rel_path)
+    _assert_dest_inside_root(dest, root)
 
     content = _load_template(f"{kind}.py").replace("CLASS_NAME", class_name)
     _write_file(dest, content)
@@ -99,9 +119,11 @@ def generate_component(kind: str, name: str, cwd: Optional[str] = None) -> str:
 
 def generate_module(name: str, cwd: Optional[str] = None) -> str:
     """Preserve existing `generate module` behavior: `{name}_module.py` in CWD."""
-    root = cwd or os.getcwd()
+    _validate_generate_name(name)
+    root = os.path.abspath(cwd or os.getcwd())
     filename = f"{name}_module.py"
     dest = os.path.join(root, filename)
+    _assert_dest_inside_root(dest, root)
     camel_name = "".join(part.capitalize() for part in name.split("_"))
     content = _load_template("module.py").format(name=name, camel_name=camel_name)
     _write_file(dest, content)

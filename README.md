@@ -119,9 +119,10 @@ nitrostack-py pack              # write dist/*.whl
 ### Upgrade, install, validate
 
 ```bash
-nitrostack-py upgrade                 # latest nitrostack on PyPI
-nitrostack-py upgrade --version 0.3.2 # pin a specific version
+nitrostack-py upgrade                 # latest nitrostack on PyPI (writes nitrostack>=latest)
+nitrostack-py upgrade --version 0.3.2 # pin exactly this version (writes nitrostack==0.3.2)
 nitrostack-py upgrade --dry-run       # print the change; do not edit files
+nitrostack-py upgrade --allow-downgrade --version 0.1.0  # required to pin an older version
 
 nitrostack-py install                 # install project + development dependencies
 nitrostack-py install --production    # skip optional extras and requirements-dev.txt
@@ -129,7 +130,7 @@ nitrostack-py install --production    # skip optional extras and requirements-de
 nitrostack-py validate                # lint deps, @mcp_app imports, and @module() refs
 ```
 
-`upgrade` updates the `nitrostack` dependency spec in `pyproject.toml` in place (and `requirements.txt` when it already pins nitrostack). `validate` reports missing/conflicting dependencies, `@mcp_app` modules that fail to import, and `@module()` `imports`/`exports` that are not real classes.
+`upgrade` updates the `nitrostack` dependency spec in `pyproject.toml` in place (and `requirements.txt` when it already pins nitrostack). `--version X` writes `nitrostack==X`. Without `--version`, the latest PyPI release is written as `nitrostack>=latest`. A target older than the currently declared version is rejected unless `--allow-downgrade` is passed. `validate` reports missing/conflicting dependencies, `@mcp_app` modules that fail to import, and `@module()` `imports`/`exports` that are not real classes.
 
 ---
 

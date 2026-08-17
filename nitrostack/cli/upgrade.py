@@ -9,11 +9,22 @@ import urllib.error
 import urllib.request
 from typing import Optional, Tuple
 
+from packaging.version import InvalidVersion, Version
+
+from nitrostack.cli._shared import (
+    add_to_toml_string_array,
+    find_toml_array_inner,
+    loads_toml,
+    read_text,
+    write_text_atomic,
+)
+
 PYPI_JSON = "https://pypi.org/pypi/nitrostack/json"
 PYPI_VERSION_JSON = "https://pypi.org/pypi/nitrostack/{version}/json"
 
+# Name must not be a prefix of nitrostack-studio / nitrostack_extras / nitrostack.contrib.
 _DEP_RE = re.compile(
-    r'(["\']?)(nitrostack)((?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[^"\'\s,#]+)?)(\1)',
+    r'(["\']?)(nitrostack)(?![\w.-])((?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[^"\'\s,#]+)?)(\1)',
     re.IGNORECASE,
 )
 
@@ -30,6 +41,8 @@ def fetch_latest_nitrostack_version(timeout: float = 15.0) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise UpgradeError(f"PyPI returned invalid JSON: {exc}") from exc
     except urllib.error.URLError as exc:
         raise UpgradeError(
             f"Could not reach PyPI to determine the latest nitrostack version: {exc}\n"
@@ -69,42 +82,55 @@ def find_current_spec(text: str) -> Optional[str]:
     return spec
 
 
-def replace_nitrostack_spec(text: str, version: str) -> Tuple[str, int]:
-    replacement = f"nitrostack>={version}"
-
+def replace_nitrostack_spec(text: str, spec: str) -> Tuple[str, int]:
     def _sub(match: re.Match) -> str:
         quote = match.group(1) or ""
-        return f"{quote}{replacement}{quote}"
+        return f"{quote}{spec}{quote}"
 
     return _DEP_RE.subn(_sub, text)
 
 
 def _add_to_pyproject_dependencies(text: str, spec: str) -> str:
-    match = re.search(r"(^dependencies\s*=\s*\[)(.*?)(\])", text, re.MULTILINE | re.DOTALL)
-    if not match:
-        # Insert a dependencies array under [project] if possible.
-        project = re.search(r"^\[project\][^\[]*", text, re.MULTILINE | re.DOTALL)
-        if not project:
+    if find_toml_array_inner(text, "dependencies"):
+        updated = add_to_toml_string_array(text, spec, "dependencies")
+        try:
+            loads_toml(updated)
+        except Exception as exc:
             raise UpgradeError(
-                "pyproject.toml has no [project] table. Add one (or add nitrostack to "
-                "requirements.txt) before running upgrade."
-            )
-        insert_at = project.end()
-        block = f'\ndependencies = [\n    "{spec}",\n]\n'
-        return text[:insert_at] + block + text[insert_at:]
-    inner = match.group(2).rstrip()
-    indent = "    "
-    addition = f'\n{indent}"{spec}",\n'
-    if inner.strip():
-        if not inner.rstrip().endswith(","):
-            # keep existing formatting; append comma + new item
-            addition = f',\n{indent}"{spec}",\n'
-        else:
-            addition = f'{indent}"{spec}",\n'
-        new_inner = inner + ("" if inner.endswith("\n") else "\n") + addition
-    else:
-        new_inner = addition
-    return text[: match.start(2)] + new_inner + text[match.end(2) :]
+                f"Refusing to write an invalid pyproject.toml after adding {spec}: {exc}"
+            ) from exc
+        return updated
+    project = re.search(r"^\[project\][^\[]*", text, re.MULTILINE | re.DOTALL)
+    if not project:
+        raise UpgradeError(
+            "pyproject.toml has no [project] table. Add one (or add nitrostack to "
+            "requirements.txt) before running upgrade."
+        )
+    insert_at = project.end()
+    block = f'\ndependencies = [\n    "{spec}",\n]\n'
+    return text[:insert_at] + block + text[insert_at:]
+
+
+def _declared_version(spec: Optional[str]) -> Optional[Version]:
+    if not spec:
+        return None
+    match = re.search(r"(?:===|==|!=|~=|>=|<=|>|<)\s*([0-9A-Za-z][0-9A-Za-z._+-]*)", spec)
+    if not match:
+        return None
+    try:
+        return Version(match.group(1))
+    except InvalidVersion:
+        return None
+
+
+def _commit_file_changes(changes: list) -> list:
+    """Write all files atomically. Originals stay intact if any write fails."""
+    written = []
+    for change in changes:
+        write_text_atomic(change["path"], change["text"])
+        written.append(change["file"])
+        print(f"Updated {change['file']}")
+    return written
 
 
 def upgrade_project(
@@ -113,6 +139,7 @@ def upgrade_project(
     version: Optional[str] = None,
     dry_run: bool = False,
     verify: bool = True,
+    allow_downgrade: bool = False,
 ) -> dict:
     """Update the nitrostack dependency spec in pyproject.toml (and requirements.txt if present)."""
     root = os.path.abspath(root or os.getcwd())
@@ -129,35 +156,60 @@ def upgrade_project(
     if version and verify:
         verify_nitrostack_version(target)
 
-    new_spec = f"nitrostack>={target}"
+    new_spec = f"nitrostack=={target}" if version else f"nitrostack>={target}"
     changes = []
-    original_pyproject = _read(pyproject) if os.path.isfile(pyproject) else None
-    original_reqs = _read(requirements) if os.path.isfile(requirements) else None
+    original_pyproject = read_text(pyproject) if os.path.isfile(pyproject) else None
+    original_reqs = read_text(requirements) if os.path.isfile(requirements) else None
+
+    current_specs = []
+    if original_pyproject is not None:
+        current_specs.append(find_current_spec(original_pyproject))
+    if original_reqs is not None:
+        current_specs.append(find_current_spec(original_reqs))
+
+    try:
+        target_ver = Version(target)
+    except InvalidVersion as exc:
+        raise UpgradeError(f"Invalid target version '{target}': {exc}") from exc
+
+    if not allow_downgrade:
+        for current in current_specs:
+            declared = _declared_version(current)
+            if declared is not None and target_ver < declared:
+                raise UpgradeError(
+                    f"Target {target} is older than the currently declared {current}. "
+                    "Re-run with --allow-downgrade if you intend to downgrade."
+                )
 
     if original_pyproject is not None:
         current = find_current_spec(original_pyproject)
-        updated, n = replace_nitrostack_spec(original_pyproject, target)
+        updated, n = replace_nitrostack_spec(original_pyproject, new_spec)
         if n == 0:
             updated = _add_to_pyproject_dependencies(original_pyproject, new_spec)
             current = current or "(missing)"
+        if updated != original_pyproject:
+            try:
+                loads_toml(updated)
+            except Exception as exc:
+                raise UpgradeError(f"Refusing to write an invalid pyproject.toml: {exc}") from exc
         changes.append(
             {
                 "file": "pyproject.toml",
+                "path": pyproject,
                 "from": current or "(missing)",
                 "to": new_spec,
                 "text": updated,
             }
         )
 
-    # Phase 5 requires pyproject.toml in-place updates. Also keep requirements.txt
-    # in sync when it already pins nitrostack, so install/pack stay consistent.
     if original_reqs is not None and find_current_spec(original_reqs):
         current = find_current_spec(original_reqs)
-        updated, n = replace_nitrostack_spec(original_reqs, target)
+        updated, n = replace_nitrostack_spec(original_reqs, new_spec)
         if n:
             changes.append(
                 {
                     "file": "requirements.txt",
+                    "path": requirements,
                     "from": current,
                     "to": new_spec,
                     "text": updated,
@@ -172,26 +224,16 @@ def upgrade_project(
 
     print("NITROSTACK — Upgrade" + (" (dry run)" if dry_run else ""))
     print(f"Target version: {target}")
+    print(f"Resulting spec: {new_spec}")
     for change in changes:
         print(f"  {change['file']}: {change['from']} → {change['to']}")
 
     if dry_run:
         print("\nDry run — no files modified.")
-        return {"version": target, "changes": changes, "dry_run": True, "written": []}
+        return {"version": target, "spec": new_spec, "changes": changes, "dry_run": True, "written": []}
 
-    written = []
-    for change in changes:
-        path = os.path.join(root, change["file"])
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(change["text"])
-        written.append(change["file"])
-        print(f"Updated {change['file']}")
+    written = _commit_file_changes(changes)
 
     print(f"\nUpgrade complete. nitrostack dependency is now {new_spec}.")
     print("Run `nitrostack-py install` to install the new version.")
-    return {"version": target, "changes": changes, "dry_run": False, "written": written}
-
-
-def _read(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
+    return {"version": target, "spec": new_spec, "changes": changes, "dry_run": False, "written": written}

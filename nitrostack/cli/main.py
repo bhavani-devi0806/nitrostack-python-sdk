@@ -8,7 +8,7 @@ import time
 from nitrostack.cli.generate import generate_component, generate_module as generate_module_from_template
 from nitrostack.cli.install import install_dependencies
 from nitrostack.cli.pack import pack_project
-from nitrostack.cli.upgrade import UpgradeError, upgrade_project
+from nitrostack.cli.upgrade import upgrade_project
 from nitrostack.cli.validators import format_report, validate_project
 
 MAIN_TEMPLATE = """import asyncio
@@ -1534,6 +1534,11 @@ def main():
         action="store_true",
         help="Show the version change without modifying pyproject.toml",
     )
+    upgrade_parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="Allow --version to pin an older release than the one currently declared",
+    )
 
     # install command
     install_parser = subparsers.add_parser(
@@ -1557,6 +1562,13 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    def _run_command(fn, *fn_args, **fn_kwargs):
+        try:
+            return fn(*fn_args, **fn_kwargs)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
 
     if args.command == "init":
         init_project(
@@ -1583,25 +1595,18 @@ def main():
         else:
             generate_component(args.generator, args.name)
     elif args.command == "pack":
-        try:
-            pack_project(dry_run=args.dry_run)
-        except Exception as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
+        _run_command(pack_project, dry_run=args.dry_run)
     elif args.command == "upgrade":
-        try:
-            upgrade_project(version=args.target_version, dry_run=args.dry_run)
-        except UpgradeError as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
+        _run_command(
+            upgrade_project,
+            version=args.target_version,
+            dry_run=args.dry_run,
+            allow_downgrade=args.allow_downgrade,
+        )
     elif args.command == "install":
-        try:
-            install_dependencies(production=args.production)
-        except Exception as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
+        _run_command(install_dependencies, production=args.production)
     elif args.command == "validate":
-        issues = validate_project()
+        issues = _run_command(validate_project)
         print(format_report(issues))
         if any(issue.severity == "error" for issue in issues):
             sys.exit(1)

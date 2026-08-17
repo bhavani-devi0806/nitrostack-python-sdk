@@ -16,30 +16,15 @@ import zipfile
 from fnmatch import fnmatch
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
-# Directories that must never ship in a pack artifact.
-_EXCLUDE_DIR_NAMES = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "env",
-    ".env",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".nox",
-    ".cache",
-    "node_modules",
-    ".next",
-    "dist",
-    "build",
-    ".eggs",
-    ".idea",
-    ".vscode",
-}
+from nitrostack.cli._shared import (
+    EXCLUDE_DIR_NAMES,
+    parse_pyproject_dependencies,
+    parse_requirements,
+    read_text,
+    requirement_name,
+)
+
+_EXCLUDE_DIR_NAMES = EXCLUDE_DIR_NAMES
 
 _EXCLUDE_SUFFIXES = {
     ".pyc",
@@ -126,11 +111,11 @@ def _matches_gitignore(rel_posix: str, patterns: Sequence[Tuple[str, bool]]) -> 
 
 
 def _should_exclude(rel_posix: str, name: str, is_dir: bool, gitignore: Sequence[Tuple[str, bool]]) -> bool:
+    if name == ".env.example":
+        return False
     if _is_secret_env(name):
         return True
     if name in _EXCLUDE_DIR_NAMES and is_dir:
-        return True
-    if name in _EXCLUDE_DIR_NAMES and not is_dir and name in {".git"}:
         return True
     if any(fnmatch(name, glob) for glob in _EXCLUDE_NAME_GLOBS):
         return True
@@ -138,10 +123,7 @@ def _should_exclude(rel_posix: str, name: str, is_dir: bool, gitignore: Sequence
         return True
     if name.endswith(".egg-info") or ".egg-info/" in rel_posix:
         return True
-    if _matches_gitignore(rel_posix, gitignore) and name != ".env.example":
-        # gitignore may ignore .env.* — still keep .env.example explicitly.
-        if name == ".env.example":
-            return False
+    if _matches_gitignore(rel_posix, gitignore):
         return True
     return False
 
@@ -177,8 +159,7 @@ def collect_pack_files(root: str) -> List[str]:
 
 
 def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8-sig") as handle:
-        return handle.read()
+    return read_text(path)
 
 
 def _parse_pyproject_field(text: str, field: str) -> Optional[str]:
@@ -187,29 +168,11 @@ def _parse_pyproject_field(text: str, field: str) -> Optional[str]:
 
 
 def _parse_pyproject_dependencies(text: str) -> List[str]:
-    match = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
-    if not match:
-        return []
-    deps: List[str] = []
-    for raw in match.group(1).split(","):
-        item = raw.strip().strip(",").strip()
-        if not item:
-            continue
-        if item.startswith("#"):
-            continue
-        deps.append(item.strip("\"'").lstrip("\ufeff").strip())
-    return deps
+    return parse_pyproject_dependencies(text)
 
 
 def _parse_requirements(path: str) -> List[str]:
-    deps: List[str] = []
-    with open(path, "r", encoding="utf-8-sig") as handle:
-        for raw in handle:
-            line = raw.strip().lstrip("\ufeff").strip()
-            if not line or line.startswith("#") or line.startswith("-"):
-                continue
-            deps.append(line)
-    return deps
+    return parse_requirements(path)
 
 
 def _project_name_and_version(root: str) -> Tuple[str, str]:
@@ -235,7 +198,7 @@ def _pep503_wheel_name(name: str) -> str:
 
 
 def _requirement_name(req: str) -> str:
-    return re.split(r"[=<>!~\[]", req.lstrip("\ufeff"), maxsplit=1)[0].strip().lower().replace("_", "-")
+    return requirement_name(req)
 
 
 def requirements_from_project(root: str) -> List[str]:
@@ -448,18 +411,22 @@ def _write_purelib_wheel(
     return wheel_path
 
 
+def _setuptools_build_wheel(wheel_dir: str) -> str:
+    from setuptools.build_meta import build_wheel as setuptools_build_wheel
+    return setuptools_build_wheel(wheel_dir)
+
+
 def _build_wheel_with_setuptools(src_root: str, wheel_dir: str) -> Optional[str]:
     """Use the setuptools PEP 517 backend when it is importable."""
-    try:
-        from setuptools.build_meta import build_wheel as setuptools_build_wheel
-    except ImportError:
-        return None
     os.makedirs(wheel_dir, exist_ok=True)
     previous = os.getcwd()
     try:
         os.chdir(src_root)
-        filename = setuptools_build_wheel(wheel_dir)
-    except Exception:
+        filename = _setuptools_build_wheel(wheel_dir)
+    except ImportError:
+        return None
+    except Exception as exc:
+        print(f"Warning: setuptools build failed, falling back: {exc}")
         return None
     finally:
         os.chdir(previous)

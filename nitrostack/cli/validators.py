@@ -11,23 +11,16 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple
 
-_EXCLUDE_DIR_NAMES = {
-    ".git",
-    ".venv",
-    "venv",
-    "env",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "node_modules",
-    ".next",
-    "dist",
-    "build",
-    ".eggs",
-    ".tox",
-    ".nox",
-}
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+
+from nitrostack.cli._shared import (
+    EXCLUDE_DIR_NAMES,
+    parse_pyproject_dependencies,
+    parse_requirements,
+    read_text,
+    split_requirement,
+)
 
 
 @dataclass
@@ -49,7 +42,7 @@ def _iter_python_files(root: str) -> Iterable[str]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames
-            if d not in _EXCLUDE_DIR_NAMES and not d.endswith(".egg-info")
+            if d not in EXCLUDE_DIR_NAMES and not d.endswith(".egg-info")
         ]
         for filename in filenames:
             if filename.endswith(".py"):
@@ -57,82 +50,54 @@ def _iter_python_files(root: str) -> Iterable[str]:
 
 
 def _read(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
+    return read_text(path)
 
 
 def _parse_pyproject_dependencies(text: str) -> List[str]:
-    match = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
-    if not match:
-        return []
-    deps: List[str] = []
-    for raw in match.group(1).split(","):
-        item = raw.strip().strip(",").strip()
-        if not item or item.startswith("#"):
-            continue
-        deps.append(item.strip("\"'"))
-    return deps
+    return parse_pyproject_dependencies(text)
 
 
 def _parse_requirements(path: str) -> List[str]:
-    deps: List[str] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line or line.startswith("#") or line.startswith("-"):
-                continue
-            deps.append(line)
-    return deps
+    return parse_requirements(path)
 
 
 def _split_req(req: str) -> Tuple[str, str]:
-    match = re.match(r"^\s*([A-Za-z0-9_.-]+)\s*(.*)$", req)
-    if not match:
-        return req.strip().lower(), ""
-    return match.group(1).lower().replace("_", "-"), match.group(2).strip()
+    return split_requirement(req)
 
 
-def _parse_version_constraint(spec: str) -> Optional[Tuple[str, str]]:
-    match = re.match(r"^(===|==|!=|~=|>=|<=|>|<)\s*([0-9A-Za-z][0-9A-Za-z._-]*)", spec.strip())
-    if not match:
+def _specifier_set(spec: str) -> Optional[SpecifierSet]:
+    text = (spec or "").strip()
+    if not text:
         return None
-    return match.group(1), match.group(2)
+    try:
+        return SpecifierSet(text)
+    except InvalidSpecifier:
+        return None
 
 
-def _version_tuple(version: str) -> Tuple[int, ...]:
-    parts = []
-    for chunk in re.split(r"[._-]", version):
-        if chunk.isdigit():
-            parts.append(int(chunk))
-        else:
-            break
-    return tuple(parts) or (0,)
+def _exact_version(spec_set: SpecifierSet) -> Optional[Version]:
+    items = list(spec_set)
+    if len(items) == 1 and items[0].operator in {"==", "==="}:
+        try:
+            return Version(items[0].version)
+        except InvalidVersion:
+            return None
+    return None
 
 
 def _constraints_conflict(a: str, b: str) -> bool:
-    """Conservative conflict check for simple numeric pins (e.g. ==1 vs ==2, >=3 vs <3)."""
-    ca = _parse_version_constraint(a)
-    cb = _parse_version_constraint(b)
-    if not ca or not cb:
+    """Conflict check using PEP 440 specifiers (pre/post/local versions included)."""
+    set_a = _specifier_set(a)
+    set_b = _specifier_set(b)
+    if set_a is None or set_b is None:
         return False
-    op_a, ver_a = ca
-    op_b, ver_b = cb
-    va, vb = _version_tuple(ver_a), _version_tuple(ver_b)
-    if op_a in {"==", "==="} and op_b in {"==", "==="}:
-        return va != vb
-    pairs = [(op_a, va, op_b, vb), (op_b, vb, op_a, va)]
-    for op_x, vx, op_y, vy in pairs:
-        if op_x in {">=", ">"} and op_y in {"==", "==="} and (
-            vy < vx or (op_x == ">" and vy <= vx)
-        ):
-            return True
-        if op_x in {"<=", "<"} and op_y in {"==", "==="} and (
-            vy > vx or (op_x == "<" and vy >= vx)
-        ):
-            return True
-        if op_x in {">=", ">"} and op_y in {"<=", "<"}:
-            if vx > vy or (vx == vy and (op_x == ">" or op_y == "<")):
-                return True
+    va, vb = _exact_version(set_a), _exact_version(set_b)
+    if va is not None and vb is not None:
+        return Version(va.base_version) != Version(vb.base_version)
+    if va is not None:
+        return not set_b.contains(va, prereleases=True)
+    if vb is not None:
+        return not set_a.contains(vb, prereleases=True)
     return False
 
 
