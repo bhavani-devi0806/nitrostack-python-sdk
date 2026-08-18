@@ -423,7 +423,8 @@ def _build_wheel_with_setuptools(src_root: str, wheel_dir: str) -> Optional[str]
     try:
         os.chdir(src_root)
         filename = _setuptools_build_wheel(wheel_dir)
-    except ImportError:
+    except ImportError as exc:
+        print(f"Warning: setuptools build backend unavailable, falling back: {exc}")
         return None
     except Exception as exc:
         print(f"Warning: setuptools build failed, falling back: {exc}")

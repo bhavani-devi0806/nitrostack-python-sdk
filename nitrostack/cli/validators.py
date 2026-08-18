@@ -193,26 +193,80 @@ def _load_module(path: str, module_name: str):
     return module
 
 
-def _file_has_decorator(path: str, decorator: str) -> bool:
+def _parse_python_ast(path: str) -> Optional[ast.AST]:
     try:
-        tree = ast.parse(_read(path), filename=path)
+        return ast.parse(_read(path), filename=path)
     except SyntaxError:
+        return None
+
+
+def _file_has_decorated_class(path: str, decorator: str) -> bool:
+    tree = _parse_python_ast(path)
+    if tree is None:
         return False
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, ast.ClassDef):
             for dec in node.decorator_list:
                 if decorator in _decorator_names(dec):
                     return True
     return False
 
 
+def _is_mcp_factory_create(call: ast.Call) -> bool:
+    """True for ``McpApplicationFactory.create(...)`` (plain or qualified)."""
+    func = call.func
+    if not isinstance(func, ast.Attribute) or func.attr != "create":
+        return False
+    value = func.value
+    if isinstance(value, ast.Name):
+        return value.id == "McpApplicationFactory"
+    if isinstance(value, ast.Attribute):
+        return value.attr == "McpApplicationFactory"
+    return False
+
+
+def _factory_create_arg_name(call: ast.Call) -> Optional[str]:
+    if not call.args:
+        return None
+    arg = call.args[0]
+    if isinstance(arg, ast.Name):
+        return arg.id
+    if isinstance(arg, ast.Attribute):
+        return arg.attr
+    return None
+
+
+def _has_module_factory_bootstrap(root: str) -> bool:
+    """True when some ``McpApplicationFactory.create(X)`` targets an ``@module`` class ``X``.
+
+    Mirrors ``McpApplication.__init__``'s ``_mcp_module_config`` path used by init templates.
+    """
+    module_class_names: Set[str] = set()
+    create_targets: Set[str] = set()
+    for path in _iter_python_files(root):
+        tree = _parse_python_ast(path)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for dec in node.decorator_list:
+                    if "module" in _decorator_names(dec):
+                        module_class_names.add(node.name)
+                        break
+            elif isinstance(node, ast.Call) and _is_mcp_factory_create(node):
+                name = _factory_create_arg_name(node)
+                if name:
+                    create_targets.add(name)
+    return bool(module_class_names & create_targets)
+
+
 def validate_mcp_app_imports(root: str) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
-    found = False
+    found_mcp_app = False
     for path in _iter_python_files(root):
-        if not _file_has_decorator(path, "mcp_app"):
+        if not _file_has_decorated_class(path, "mcp_app"):
             continue
-        found = True
+        found_mcp_app = True
         rel = os.path.relpath(path, root)
         module_name = f"nitrostack_validate_{_module_name_from_path(root, path).replace('.', '_')}"
         try:
@@ -256,12 +310,13 @@ def validate_mcp_app_imports(root: str) -> List[ValidationIssue]:
                     "Pass the AppModule class itself, not an instance or string.",
                     rel,
                 ))
-    if not found:
+    if not found_mcp_app and not _has_module_factory_bootstrap(root):
         issues.append(ValidationIssue(
             "warning",
-            "No @mcp_app-decorated class was found in this project.",
-            "If this is an MCP server, decorate your application class with "
-            "@mcp_app(module=AppModule, server=ServerConfig(...)).",
+            "No @mcp_app- or @module-decorated application class was found in this project.",
+            "If this is an MCP server, decorate a root class with "
+            "@mcp_app(module=AppModule, server=ServerConfig(...)) "
+            "or pass a @module-decorated class to McpApplicationFactory.create().",
         ))
     return issues
 
@@ -273,7 +328,7 @@ def _is_real_class(value: Any) -> bool:
 def validate_module_references(root: str) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
     for path in _iter_python_files(root):
-        if not _file_has_decorator(path, "module"):
+        if not _file_has_decorated_class(path, "module"):
             continue
         rel = os.path.relpath(path, root)
         module_name = f"nitrostack_validate_mod_{_module_name_from_path(root, path).replace('.', '_')}"

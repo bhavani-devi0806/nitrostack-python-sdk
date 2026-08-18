@@ -124,13 +124,24 @@ def _declared_version(spec: Optional[str]) -> Optional[Version]:
 
 
 def _commit_file_changes(changes: list) -> list:
-    """Write all files atomically. Originals stay intact if any write fails."""
+    """Write all files atomically; roll back earlier writes if a later one fails."""
     written = []
-    for change in changes:
-        write_text_atomic(change["path"], change["text"])
-        written.append(change["file"])
-        print(f"Updated {change['file']}")
-    return written
+    try:
+        for change in changes:
+            write_text_atomic(change["path"], change["text"])
+            written.append(change)
+            print(f"Updated {change['file']}")
+        return [change["file"] for change in written]
+    except Exception:
+        for change in reversed(written):
+            original = change.get("original")
+            if original is None:
+                continue
+            try:
+                write_text_atomic(change["path"], original)
+            except OSError:
+                pass
+        raise
 
 
 def upgrade_project(
@@ -199,6 +210,7 @@ def upgrade_project(
                 "from": current or "(missing)",
                 "to": new_spec,
                 "text": updated,
+                "original": original_pyproject,
             }
         )
 
@@ -213,6 +225,7 @@ def upgrade_project(
                     "from": current,
                     "to": new_spec,
                     "text": updated,
+                    "original": original_reqs,
                 }
             )
 
