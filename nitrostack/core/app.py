@@ -52,6 +52,7 @@ class ServerConfig:
     stateless: bool = False
     max_sessions: Optional[int] = None
     session_timeout_ms: Optional[int] = None
+    json_response: bool = False
 
 
 def mcp_app(module: Type, server: ServerConfig):
@@ -859,6 +860,7 @@ class McpApplication:
         session_idle_timeout: Optional[float] = None,
         enable_cors: bool = True,
         stateless: Optional[bool] = None,
+        json_response: Optional[bool] = None,
     ) -> Any:
         """
         Build the Starlette app wiring the owned low-level server to the Streamable
@@ -876,6 +878,7 @@ class McpApplication:
             session_idle_timeout=session_idle_timeout,
             enable_cors=enable_cors,
             stateless=self.server_config.stateless if stateless is None else stateless,
+            json_response=self.server_config.json_response if json_response is None else json_response,
         )
 
     async def _run_stdio(self) -> None:
@@ -916,6 +919,9 @@ class McpApplication:
         stateless = self._env_bool("MCP_STATELESS")
         if stateless is None:
             stateless = self.server_config.stateless
+        json_response = self._env_bool("MCP_JSON_RESPONSE")
+        if json_response is None:
+            json_response = self.server_config.json_response
         max_sessions = self._env_int("MCP_MAX_SESSIONS") or self.server_config.max_sessions
         session_timeout_ms = self._env_int("MCP_SESSION_TIMEOUT_MS") or self.server_config.session_timeout_ms
         session_idle_timeout = (session_timeout_ms / 1000) if session_timeout_ms else None
@@ -927,6 +933,7 @@ class McpApplication:
                 max_sessions=max_sessions,
                 session_idle_timeout=session_idle_timeout,
                 stateless=stateless,
+                json_response=json_response,
             )
             config = uvicorn.Config(
                 app,
@@ -944,6 +951,7 @@ class McpApplication:
                 max_sessions=max_sessions,
                 session_idle_timeout=session_idle_timeout,
                 stateless=stateless,
+                json_response=json_response,
             )
             await run_dual(
                 self,

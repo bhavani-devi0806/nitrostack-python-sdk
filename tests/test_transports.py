@@ -548,6 +548,92 @@ def test_legacy_sse_messages_not_swallowed_by_streamable_http():
     print("Success! Legacy SSE /mcp/messages/ routes correctly (not swallowed by Streamable HTTP).")
 
 
+# ---------------------------------------------------------------------------
+# 11. Client-header tolerance: `StreamableHTTPServerTransport` matches Accept
+#    media types with `startswith` (so `*/*` is rejected with 406) and rejects
+#    any MCP-Protocol-Version it doesn't know with 400. Both happen before the
+#    JSON-RPC layer, so the client just sees a stream open and close with no
+#    response on it.
+# ---------------------------------------------------------------------------
+
+def test_wildcard_and_missing_accept_are_honoured():
+    app = asyncio.run(_build_app())
+    http_app = build_http_app(app, enable_cors=True)
+
+    with TestClient(http_app) as client:
+        init = client.post(
+            "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "*/*"},
+            json=INITIALIZE_BODY,
+        )
+        assert init.status_code == 200, (
+            f"POST /mcp with Accept: */* should be served, got {init.status_code}: {init.text}"
+        )
+        session_id = init.headers.get("mcp-session-id")
+        assert session_id
+        assert _extract_json_rpc(init)["result"]["protocolVersion"]
+
+        client.post(
+            "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "*/*", "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        listed = client.post(
+            "/mcp",
+            headers={"Content-Type": "application/json", "Accept": "text/html,*/*;q=0.8", "mcp-session-id": session_id},
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert listed.status_code == 200, listed.text
+        assert "echo" in [t["name"] for t in _extract_json_rpc(listed)["result"]["tools"]]
+
+        # No Accept header at all means "anything" per RFC 9110. Reaching the
+        # session check (400) instead of content negotiation (406) is the proof.
+        no_accept = client.get("/mcp", headers={"Accept": ""})
+        assert no_accept.status_code == 400, no_accept.text
+        assert "Not Acceptable" not in no_accept.text
+
+    print("Success! Wildcard and absent Accept headers no longer 406 on /mcp.")
+
+
+def test_unsupported_protocol_version_header_does_not_fail_request():
+    app = asyncio.run(_build_app())
+    http_app = build_http_app(app, enable_cors=True)
+
+    with TestClient(http_app) as client:
+        session_id = _initialize(client)
+
+        listed = client.post(
+            "/mcp",
+            headers={**JSON_HEADERS, "mcp-session-id": session_id, "MCP-Protocol-Version": "2026-06-18"},
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert listed.status_code == 200, (
+            f"a newer-than-supported protocol version should not fail the request, got: {listed.text}"
+        )
+        assert "echo" in [t["name"] for t in _extract_json_rpc(listed)["result"]["tools"]]
+
+    print("Success! An unknown MCP-Protocol-Version no longer turns into a 400.")
+
+
+def test_delete_terminates_live_session_and_404s_unknown_one():
+    app = asyncio.run(_build_app())
+    http_app = build_http_app(app, enable_cors=True)
+
+    with TestClient(http_app) as client:
+        session_id = _initialize(client)
+
+        terminated = client.delete("/mcp", headers={**JSON_HEADERS, "mcp-session-id": session_id})
+        assert terminated.status_code in (200, 204), terminated.text
+
+        # A 404 on DELETE means the session id is unknown (already terminated,
+        # or minted by a previous run of the server), not that routing is broken.
+        unknown = client.delete("/mcp", headers={**JSON_HEADERS, "mcp-session-id": "0" * 32})
+        assert unknown.status_code == 404, unknown.text
+
+    print("Success! DELETE /mcp terminates a live session and 404s an unknown one.")
+
+
 if __name__ == "__main__":
     DIContainer.reset()
     test_http_health_and_cors()
@@ -560,4 +646,7 @@ if __name__ == "__main__":
     test_dual_mode_coordinated_shutdown()
     test_mcp_path_does_not_redirect()
     test_legacy_sse_messages_not_swallowed_by_streamable_http()
+    test_wildcard_and_missing_accept_are_honoured()
+    test_unsupported_protocol_version_header_does_not_fail_request()
+    test_delete_terminates_live_session_and_404s_unknown_one()
     print("\nAll Phase 3 transport tests passed successfully!")

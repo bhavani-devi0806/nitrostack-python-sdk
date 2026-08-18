@@ -170,6 +170,7 @@ The SDK reads standard settings from the environment or `.env` files:
 | `NITROSTACK_LOG_FILE` | Destination file for logs (default: `nitrostack.log`). |
 | `NITROSTACK_LOG_LEVEL` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 | `NITROSTACK_LOG_TO_STDOUT` | Set to `true` to allow logging to stdout under stdio transport (Caution: may corrupt protocol stream). |
+| `NITROSTACK_HTTP_DEBUG` | Set to `1` to log every HTTP request (method, path, headers, body) and response status to stderr. Use when diagnosing a client that fails to connect: uvicorn's access log shows neither headers nor timestamps. |
 
 ---
 

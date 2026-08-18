@@ -27,6 +27,7 @@ import contextlib
 import html
 import logging
 import os
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -40,6 +41,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 
 if TYPE_CHECKING:
     from nitrostack.core.app import McpApplication
@@ -58,6 +60,10 @@ CORS_ALLOW_HEADERS = [
     "Last-Event-ID",
 ]
 CORS_EXPOSE_HEADERS = ["Mcp-Session-Id"]
+
+# The Accept value `StreamableHTTPServerTransport` requires: it needs
+# `application/json` on POST and `text/event-stream` on both POST and GET.
+MCP_ACCEPT = "application/json, text/event-stream"
 
 _PROCESS_START = time.monotonic()
 
@@ -123,6 +129,95 @@ def _env_list(name: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _enable_trace_logging() -> None:
+    """
+    Give `logger` its own stderr handler so tracing works regardless of how the
+    host application configured logging.
+
+    `FileLogger` only attaches handlers to the `nitrostack` logger when it is
+    first instantiated, which for an HTTP server may not happen until a tool
+    runs. Until then this module's records fall through to `logging`'s
+    last-resort handler and INFO is discarded. Propagation is disabled so the
+    traces are not emitted twice once `FileLogger` does attach its handler.
+    stderr keeps them off stdout, which dual mode uses for JSON-RPC.
+    """
+    if any(getattr(handler, "_nitrostack_trace", False) for handler in logger.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (%(name)s): %(message)s"))
+    handler._nitrostack_trace = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+class RequestTraceMiddleware:
+    """
+    Log the raw request line, headers and body of every HTTP request, plus the
+    response status and headers.
+
+    Enabled only when `NITROSTACK_HTTP_DEBUG=1`. uvicorn's access log has no
+    timestamps and no headers, which makes it impossible to tell *why* the
+    `mcp` SDK rejected a client request (a `406` and a `400` from the SDK are
+    both header-driven) or even to correlate a failed client connection with a
+    log line. This middleware is the outermost layer so it sees requests
+    exactly as the client sent them, before CORS or any path rewriting.
+    """
+
+    MAX_BODY_CHARS = 2000
+    REDACTED_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @classmethod
+    def _decode_headers(cls, raw: Any) -> Dict[str, str]:
+        headers = {}
+        for key, value in raw or []:
+            name = key.decode("latin-1")
+            headers[name] = "<redacted>" if name.lower() in cls.REDACTED_HEADERS else value.decode("latin-1")
+        return headers
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method")
+        path = scope.get("path")
+        query = (scope.get("query_string") or b"").decode("latin-1")
+        target = f"{path}?{query}" if query else path
+        logger.info("trace >> %s %s headers=%s", method, target, self._decode_headers(scope.get("headers")))
+
+        async def traced_receive() -> Any:
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body") or b""
+                if body:
+                    text = body.decode("utf-8", errors="replace")
+                    if len(text) > self.MAX_BODY_CHARS:
+                        text = text[: self.MAX_BODY_CHARS] + "...<truncated>"
+                    logger.info("trace >> %s %s body=%s", method, target, text)
+            return message
+
+        async def traced_send(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                logger.info(
+                    "trace << %s %s status=%s headers=%s",
+                    method,
+                    target,
+                    message.get("status"),
+                    self._decode_headers(message.get("headers")),
+                )
+            await send(message)
+
+        await self.app(scope, traced_receive, traced_send)
+
+
 class ExactEndpointSlashMiddleware:
     """
     Internally rewrite `/mcp` → `/mcp/` so Starlette does not 307.
@@ -145,6 +240,85 @@ class ExactEndpointSlashMiddleware:
             raw = scope.get("raw_path")
             if isinstance(raw, (bytes, bytearray)):
                 scope["raw_path"] = raw.rstrip(b"/") + b"/"
+        await self.app(scope, receive, send)
+
+
+class HeaderCompatMiddleware:
+    """
+    Normalize `Accept` and `MCP-Protocol-Version` on the Streamable HTTP mount
+    so tolerable client quirks don't turn into a failed connection.
+
+    `StreamableHTTPServerTransport` matches Accept media types with
+    `str.startswith`, so it does not honour wildcards: a client sending
+    `Accept: */*` (or no Accept at all, which RFC 9110 also defines as
+    accepting anything) is rejected with `406` even though it accepts
+    everything the transport can send. It also rejects a request with `400` when
+    `MCP-Protocol-Version` names a version it doesn't know, which breaks a
+    client that advertises a spec release newer than the installed `mcp` SDK
+    even though the session itself negotiated a version both sides support.
+
+    Both rejections happen before the JSON-RPC layer, so the client sees a
+    stream that opens and closes with no response on it and no explanation.
+    Requests that already satisfy the transport pass through untouched.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _normalize_accept(value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return MCP_ACCEPT
+        media_types = [media_type.strip() for media_type in value.split(",")]
+        has_json = any(media_type.startswith("application/json") for media_type in media_types)
+        has_sse = any(media_type.startswith("text/event-stream") for media_type in media_types)
+        if has_json and has_sse:
+            return None
+        # Only a wildcard is rewritten. A client that names concrete media types
+        # but omits one the transport needs is genuinely non-compliant (the spec
+        # requires both on POST), so it keeps getting the transport's 406.
+        if any(media_type.startswith("*/*") for media_type in media_types):
+            return MCP_ACCEPT
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers: List[Any] = list(scope.get("headers") or [])
+        raw_accept = next((value for key, value in headers if key.lower() == b"accept"), None)
+        accept = self._normalize_accept(raw_accept.decode("latin-1") if raw_accept is not None else None)
+
+        raw_version = next(
+            (value for key, value in headers if key.lower() == b"mcp-protocol-version"),
+            None,
+        )
+        drop_version = raw_version is not None and raw_version.decode("latin-1") not in SUPPORTED_PROTOCOL_VERSIONS
+
+        if accept is None and not drop_version:
+            await self.app(scope, receive, send)
+            return
+
+        rewritten = [
+            (key, value)
+            for key, value in headers
+            if not (key.lower() == b"accept" and accept is not None)
+            and not (key.lower() == b"mcp-protocol-version" and drop_version)
+        ]
+        if accept is not None:
+            rewritten.append((b"accept", accept.encode("latin-1")))
+            logger.debug("Rewrote Accept %r -> %r for %s", raw_accept, accept, scope.get("path"))
+        if drop_version:
+            logger.debug(
+                "Dropped unsupported MCP-Protocol-Version %r for %s (supported: %s)",
+                raw_version,
+                scope.get("path"),
+                ", ".join(SUPPORTED_PROTOCOL_VERSIONS),
+            )
+
+        scope = dict(scope)
+        scope["headers"] = rewritten
         await self.app(scope, receive, send)
 
 
@@ -240,6 +414,7 @@ def build_http_app(
     session_idle_timeout: Optional[float] = None,
     enable_cors: bool = True,
     stateless: bool = False,
+    json_response: bool = False,
 ) -> Starlette:
     """
     Build the Starlette app exposing NitroStack's owned low-level server over
@@ -262,6 +437,12 @@ def build_http_app(
             This is the primitive the `2026-07-28` stateless MCP spec needs;
             exposed here as a config knob so adopting that spec later doesn't
             require touching this wiring again.
+        json_response: When `True`, a POST carrying a JSON-RPC request is
+            answered with a plain `application/json` body instead of a
+            `text/event-stream` SSE frame. The spec allows either, but a client
+            that doesn't implement SSE parsing for POST responses sees the SSE
+            form as a stream that ended without a result. Server-initiated
+            streaming (progress, notifications) is unavailable in this mode.
     """
     security_settings = None
     if not enable_cors:
@@ -276,6 +457,7 @@ def build_http_app(
     session_manager = StreamableHTTPSessionManager(
         app=mcp_app.mcp_server,
         stateless=stateless,
+        json_response=json_response,
         session_idle_timeout=None if stateless else session_idle_timeout,
         security_settings=security_settings,
     )
@@ -290,7 +472,9 @@ def build_http_app(
     async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
         await session_manager.handle_request(scope, receive, send)
 
-    mcp_asgi_app: ASGIApp = handle_streamable_http
+    # Wraps only the Streamable HTTP mount, so `/mcp/health` and the legacy SSE
+    # routes keep their own (correct) content negotiation.
+    mcp_asgi_app: ASGIApp = HeaderCompatMiddleware(handle_streamable_http)
     session_cap: Optional[SessionCapMiddleware] = None
     if max_sessions and not stateless:
         session_cap = SessionCapMiddleware(
@@ -310,6 +494,7 @@ def build_http_app(
                 "transport": "streamable-http",
                 "protocolVersion": "2025-06-18",
                 "stateless": stateless,
+                "jsonResponse": json_response,
                 "sessions": session_cap.active_session_count if session_cap else None,
                 "uptimeSeconds": round(time.monotonic() - _PROCESS_START, 2),
             }
@@ -392,5 +577,9 @@ def build_http_app(
                 expose_headers=CORS_EXPOSE_HEADERS,
             ),
         )
+
+    if _env_flag("NITROSTACK_HTTP_DEBUG"):
+        _enable_trace_logging()
+        middleware.insert(0, Middleware(RequestTraceMiddleware))
 
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
